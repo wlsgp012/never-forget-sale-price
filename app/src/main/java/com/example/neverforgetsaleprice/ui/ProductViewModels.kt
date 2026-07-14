@@ -103,10 +103,12 @@ class AddProductViewModel(
             when (val result = repository.fetchMetadata(url)) {
                 is ProductFetchResult.Success -> {
                     val metadata = result.metadata
+                    val suggestedPrice = metadata.price?.toString().orEmpty()
                     state.value = state.value.copy(
                         isLoading = false,
                         name = metadata.title.orEmpty(),
-                        currentPrice = metadata.price?.toString().orEmpty(),
+                        originalPrice = state.value.originalPrice.ifBlank { suggestedPrice },
+                        currentPrice = suggestedPrice,
                         imageUrl = metadata.imageUrl.orEmpty(),
                         confidenceNote = metadata.confidenceNote,
                         errorMessage = null
