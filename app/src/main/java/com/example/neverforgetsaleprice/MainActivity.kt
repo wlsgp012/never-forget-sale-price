@@ -7,7 +7,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Arrangement
@@ -44,6 +46,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -67,6 +72,7 @@ import com.example.neverforgetsaleprice.domain.DiscountPolicy
 import com.example.neverforgetsaleprice.domain.PriceFormatter
 import com.example.neverforgetsaleprice.ui.AddProductState
 import com.example.neverforgetsaleprice.ui.AddProductViewModel
+import com.example.neverforgetsaleprice.ui.ProductEditState
 import com.example.neverforgetsaleprice.ui.ProductDetailViewModel
 import com.example.neverforgetsaleprice.ui.ProductListViewModel
 import com.example.neverforgetsaleprice.ui.RepositoryViewModelFactory
@@ -124,10 +130,53 @@ private fun SalePriceApp(initialProductId: Long?) {
                         }
                     )
                     val state by viewModel.state.collectAsStateWithLifecycle()
+                    val actionMessage by viewModel.actionMessage
+                    var pendingExportJson by remember { mutableStateOf<String?>(null) }
+                    val exportLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.CreateDocument("application/json")
+                    ) { uri ->
+                        val json = pendingExportJson
+                        pendingExportJson = null
+                        if (uri == null || json == null) return@rememberLauncherForActivityResult
+                        runCatching {
+                            context.contentResolver.openOutputStream(uri)?.use { stream ->
+                                stream.write(json.toByteArray())
+                            } ?: error("파일을 열 수 없습니다.")
+                        }.onFailure {
+                            viewModel.setActionMessage("내보내기에 실패했습니다: ${it.message}")
+                        }
+                    }
+                    val importLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.OpenDocument()
+                    ) { uri ->
+                        if (uri == null) return@rememberLauncherForActivityResult
+                        runCatching {
+                            context.contentResolver.openInputStream(uri)?.use { stream ->
+                                stream.bufferedReader().readText()
+                            } ?: error("파일을 열 수 없습니다.")
+                        }.onSuccess { json ->
+                            viewModel.importProducts(json) {
+                                PriceCheckScheduler.scheduleNow(context.applicationContext)
+                            }
+                        }.onFailure {
+                            viewModel.setActionMessage("가져오기에 실패했습니다: ${it.message}")
+                        }
+                    }
                     ProductListScreen(
                         products = state.products,
+                        actionMessage = actionMessage,
                         onAddClick = { navController.navigate(Routes.Add) },
-                        onProductClick = { navController.navigate(Routes.detail(it.id)) }
+                        onProductClick = { navController.navigate(Routes.detail(it.id)) },
+                        onExportClick = {
+                            viewModel.exportProducts { json ->
+                                pendingExportJson = json
+                                exportLauncher.launch("never-forget-sale-price-products.json")
+                            }
+                        },
+                        onImportClick = {
+                            importLauncher.launch(arrayOf("application/json", "text/json", "text/plain"))
+                        },
+                        onClearActionMessage = viewModel::clearActionMessage
                     )
                 }
                 composable(Routes.Add) {
@@ -170,9 +219,21 @@ private fun SalePriceApp(initialProductId: Long?) {
                         }
                     )
                     val state by viewModel.state.collectAsStateWithLifecycle()
+                    val editState by viewModel.editState
                     ProductDetailScreen(
                         product = state.product,
+                        editState = editState,
                         onBack = { navController.popBackStack() },
+                        onEdit = viewModel::startEdit,
+                        onCancelEdit = viewModel::cancelEdit,
+                        onEditOriginalPriceChange = viewModel::updateEditOriginalPrice,
+                        onEditCheckIntervalValueChange = viewModel::updateEditCheckIntervalValue,
+                        onEditCheckIntervalUnitChange = viewModel::updateEditCheckIntervalUnit,
+                        onSaveEdit = { product ->
+                            viewModel.saveEdit(product) {
+                                PriceCheckScheduler.scheduleNow(context.applicationContext)
+                            }
+                        },
                         onActiveChange = { product, active -> viewModel.setActive(product, active) },
                         onDelete = { product ->
                             viewModel.delete(product) {
@@ -192,11 +253,23 @@ private fun SalePriceApp(initialProductId: Long?) {
 @Composable
 private fun ProductListScreen(
     products: List<ProductEntity>,
+    actionMessage: String?,
     onAddClick: () -> Unit,
-    onProductClick: (ProductEntity) -> Unit
+    onProductClick: (ProductEntity) -> Unit,
+    onExportClick: () -> Unit,
+    onImportClick: () -> Unit,
+    onClearActionMessage: () -> Unit
 ) {
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Sale Price Watch") }) },
+        topBar = {
+            TopAppBar(
+                title = { Text("Sale Price Watch") },
+                actions = {
+                    TextButton(onClick = onImportClick) { Text("가져오기") }
+                    TextButton(onClick = onExportClick) { Text("내보내기") }
+                }
+            )
+        },
         floatingActionButton = {
             FloatingActionButton(onClick = onAddClick) {
                 Text("+", style = MaterialTheme.typography.headlineSmall)
@@ -204,7 +277,10 @@ private fun ProductListScreen(
         }
     ) { padding ->
         if (products.isEmpty()) {
-            EmptyState(Modifier.padding(padding))
+            Column(modifier = Modifier.padding(padding)) {
+                ActionMessage(actionMessage, onClearActionMessage)
+                EmptyState()
+            }
         } else {
             LazyColumn(
                 modifier = Modifier
@@ -213,9 +289,35 @@ private fun ProductListScreen(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                item {
+                    ActionMessage(actionMessage, onClearActionMessage)
+                }
                 items(products, key = { it.id }) { product ->
                     ProductRow(product = product, onClick = { onProductClick(product) })
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActionMessage(message: String?, onClear: () -> Unit) {
+    if (message == null) return
+    Card(
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(message, modifier = Modifier.weight(1f))
+            TextButton(onClick = onClear) {
+                Text("닫기")
             }
         }
     }
@@ -414,7 +516,14 @@ private fun AddProductScreen(
 @Composable
 private fun ProductDetailScreen(
     product: ProductEntity?,
+    editState: ProductEditState?,
     onBack: () -> Unit,
+    onEdit: (ProductEntity) -> Unit,
+    onCancelEdit: () -> Unit,
+    onEditOriginalPriceChange: (String) -> Unit,
+    onEditCheckIntervalValueChange: (String) -> Unit,
+    onEditCheckIntervalUnitChange: (CheckIntervalUnit) -> Unit,
+    onSaveEdit: (ProductEntity) -> Unit,
     onActiveChange: (ProductEntity, Boolean) -> Unit,
     onDelete: (ProductEntity) -> Unit
 ) {
@@ -462,6 +571,23 @@ private fun ProductDetailScreen(
             InfoLine("조회 주기", CheckInterval.format(product.checkIntervalSeconds))
             InfoLine("확인 상태", product.statusText())
             InfoLine("마지막 알림", product.lastNotifiedAtMillis?.formatTime() ?: "-")
+            if (editState == null) {
+                OutlinedButton(
+                    onClick = { onEdit(product) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("가격/조회 주기 수정")
+                }
+            } else {
+                ProductEditForm(
+                    state = editState,
+                    onOriginalPriceChange = onEditOriginalPriceChange,
+                    onCheckIntervalValueChange = onEditCheckIntervalValueChange,
+                    onCheckIntervalUnitChange = onEditCheckIntervalUnitChange,
+                    onSave = { onSaveEdit(product) },
+                    onCancel = onCancelEdit
+                )
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("모니터링", modifier = Modifier.weight(1f))
                 Switch(
@@ -482,6 +608,84 @@ private fun ProductDetailScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("삭제")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProductEditForm(
+    state: ProductEditState,
+    onOriginalPriceChange: (String) -> Unit,
+    onCheckIntervalValueChange: (String) -> Unit,
+    onCheckIntervalUnitChange: (CheckIntervalUnit) -> Unit,
+    onSave: () -> Unit,
+    onCancel: () -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            OutlinedTextField(
+                value = state.originalPrice,
+                onValueChange = onOriginalPriceChange,
+                label = { Text("원래 가격") },
+                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
+            Text("조회 주기", style = MaterialTheme.typography.titleSmall)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = state.checkIntervalValue,
+                    onValueChange = onCheckIntervalValueChange,
+                    label = { Text("값") },
+                    modifier = Modifier.weight(1f),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+                CheckIntervalUnit.entries.forEach { unit ->
+                    if (state.checkIntervalUnit == unit) {
+                        Button(onClick = { onCheckIntervalUnitChange(unit) }) {
+                            Text(unit.label)
+                        }
+                    } else {
+                        OutlinedButton(onClick = { onCheckIntervalUnitChange(unit) }) {
+                            Text(unit.label)
+                        }
+                    }
+                }
+            }
+            Text(
+                "저장될 주기: ${CheckInterval.format(state.checkIntervalSeconds())}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            state.errorMessage?.let {
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier.weight(1f),
+                    enabled = !state.isSaving
+                ) {
+                    Text("취소")
+                }
+                Button(
+                    onClick = onSave,
+                    modifier = Modifier.weight(1f),
+                    enabled = !state.isSaving
+                ) {
+                    Text(if (state.isSaving) "저장 중" else "저장")
+                }
             }
         }
     }

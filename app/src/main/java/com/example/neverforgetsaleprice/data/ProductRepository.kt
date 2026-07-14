@@ -12,6 +12,8 @@ import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 
 class ProductRepository(
     private val productDao: ProductDao,
@@ -107,6 +109,73 @@ class ProductRepository(
 
     suspend fun setProductActive(product: ProductEntity, active: Boolean) {
         productDao.update(product.copy(isActive = active, updatedAtMillis = clock()))
+    }
+
+    suspend fun exportProductsJson(): String = withContext(Dispatchers.IO) {
+        val products = productDao.getAllProducts()
+        JSONObject()
+            .put("version", 1)
+            .put("exportedAtMillis", clock())
+            .put(
+                "products",
+                JSONArray().apply {
+                    products.forEach { put(it.toJson()) }
+                }
+            )
+            .toString(2)
+    }
+
+    suspend fun importProductsJson(json: String): ImportProductsResult = withContext(Dispatchers.IO) {
+        runCatching {
+            val root = JSONObject(json)
+            val products = root.optJSONArray("products")
+                ?: return@withContext ImportProductsResult.Failure("상품 목록을 찾지 못했습니다.")
+            var inserted = 0
+            var updated = 0
+            val now = clock()
+
+            for (index in 0 until products.length()) {
+                val productJson = products.optJSONObject(index) ?: continue
+                val url = productJson.optString("url").trim()
+                val name = productJson.optString("name").trim()
+                val originalPrice = productJson.optLong("originalPrice", 0L)
+                val checkIntervalSeconds = productJson.optLong(
+                    "checkIntervalSeconds",
+                    CheckInterval.DEFAULT_SECONDS
+                )
+                val currentPrice = productJson.optNullableLong("lastCheckedPrice")
+                val validationError = validateProduct(
+                    url = url,
+                    name = name,
+                    originalPrice = originalPrice,
+                    checkIntervalSeconds = checkIntervalSeconds,
+                    currentPrice = currentPrice
+                )
+                if (validationError != null) continue
+
+                val existing = productDao.getProductByUrl(url)
+                val imported = productJson.toProductEntity(
+                    id = existing?.id ?: 0L,
+                    now = now
+                )
+                if (existing == null) {
+                    productDao.insert(imported)
+                    inserted += 1
+                } else {
+                    productDao.update(
+                        imported.copy(
+                            id = existing.id,
+                            createdAtMillis = existing.createdAtMillis
+                        )
+                    )
+                    updated += 1
+                }
+            }
+
+            ImportProductsResult.Success(inserted = inserted, updated = updated)
+        }.getOrElse { error ->
+            ImportProductsResult.Failure(error.message ?: "JSON 파일을 읽지 못했습니다.")
+        }
     }
 
     suspend fun checkActiveProducts(onNotificationNeeded: suspend (ProductEntity, Int, Long) -> Boolean) {
@@ -233,9 +302,74 @@ class ProductRepository(
             else -> message ?: "페이지를 분석하지 못했습니다."
         }
     }
+
+    private fun ProductEntity.toJson(): JSONObject {
+        return JSONObject()
+            .put("url", url)
+            .put("name", name)
+            .put("originalPrice", originalPrice)
+            .put("checkIntervalSeconds", checkIntervalSeconds)
+            .put("imageUrl", imageUrl)
+            .put("isActive", isActive)
+            .put("lastCheckedPrice", lastCheckedPrice)
+            .put("lastCheckedAtMillis", lastCheckedAtMillis)
+            .put("lastCheckStatus", lastCheckStatus.name)
+            .put("lastCheckError", lastCheckError)
+            .put("lastNotifiedPrice", lastNotifiedPrice)
+            .put("lastNotifiedDiscountPercent", lastNotifiedDiscountPercent)
+            .put("lastNotifiedAtMillis", lastNotifiedAtMillis)
+            .put("createdAtMillis", createdAtMillis)
+            .put("updatedAtMillis", updatedAtMillis)
+    }
+
+    private fun JSONObject.toProductEntity(id: Long, now: Long): ProductEntity {
+        return ProductEntity(
+            id = id,
+            url = optString("url").trim(),
+            name = optString("name").trim(),
+            originalPrice = optLong("originalPrice"),
+            checkIntervalSeconds = CheckInterval.clamp(
+                optLong("checkIntervalSeconds", CheckInterval.DEFAULT_SECONDS)
+            ),
+            imageUrl = optStringOrNull("imageUrl"),
+            isActive = optBoolean("isActive", true),
+            lastCheckedPrice = optNullableLong("lastCheckedPrice"),
+            lastCheckedAtMillis = optNullableLong("lastCheckedAtMillis"),
+            lastCheckStatus = optString("lastCheckStatus")
+                .takeIf { it.isNotBlank() }
+                ?.let { runCatching { CheckStatus.valueOf(it) }.getOrDefault(CheckStatus.NeverChecked) }
+                ?: CheckStatus.NeverChecked,
+            lastCheckError = optStringOrNull("lastCheckError"),
+            lastNotifiedPrice = optNullableLong("lastNotifiedPrice"),
+            lastNotifiedDiscountPercent = optNullableInt("lastNotifiedDiscountPercent"),
+            lastNotifiedAtMillis = optNullableLong("lastNotifiedAtMillis"),
+            createdAtMillis = optNullableLong("createdAtMillis") ?: now,
+            updatedAtMillis = now
+        )
+    }
+
+    private fun JSONObject.optStringOrNull(key: String): String? {
+        if (isNull(key)) return null
+        return optString(key).takeIf { it.isNotBlank() }
+    }
+
+    private fun JSONObject.optNullableLong(key: String): Long? {
+        if (isNull(key) || !has(key)) return null
+        return runCatching { getLong(key) }.getOrNull()
+    }
+
+    private fun JSONObject.optNullableInt(key: String): Int? {
+        if (isNull(key) || !has(key)) return null
+        return runCatching { getInt(key) }.getOrNull()
+    }
 }
 
 sealed interface SaveProductResult {
     data class Success(val productId: Long) : SaveProductResult
     data class ValidationError(val message: String) : SaveProductResult
+}
+
+sealed interface ImportProductsResult {
+    data class Success(val inserted: Int, val updated: Int) : ImportProductsResult
+    data class Failure(val message: String) : ImportProductsResult
 }

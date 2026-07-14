@@ -19,6 +19,12 @@ interface ProductDao {
     @Query("SELECT * FROM products WHERE id = :id")
     suspend fun getProduct(id: Long): ProductEntity?
 
+    @Query("SELECT * FROM products")
+    suspend fun getAllProducts(): List<ProductEntity>
+
+    @Query("SELECT * FROM products WHERE url = :url LIMIT 1")
+    suspend fun getProductByUrl(url: String): ProductEntity?
+
     @Query("SELECT * FROM products WHERE isActive = 1 ORDER BY updatedAtMillis DESC")
     suspend fun getActiveProducts(): List<ProductEntity>
 
