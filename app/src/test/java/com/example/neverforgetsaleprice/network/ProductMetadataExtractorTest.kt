@@ -54,4 +54,68 @@ class ProductMetadataExtractorTest {
         assertEquals("https://example.com/meta.jpg", metadata.imageUrl)
         assertEquals("price-like meta tag", metadata.confidenceNote)
     }
+
+    @Test
+    fun extractsJsonLdOfferPriceSpecificationBeforeStrikethroughPrice() {
+        val html = """
+            <html>
+              <head>
+                <script type="application/ld+json">
+                {
+                  "@context": "https://schema.org",
+                  "@type": "Product",
+                  "name": "디지몬 스토리 타임 스트레인저",
+                  "image": "https://example.com/digimon.jpg",
+                  "offers": {
+                    "@type": "Offer",
+                    "priceSpecification": [
+                      {
+                        "@type": "UnitPriceSpecification",
+                        "price": 41880,
+                        "priceCurrency": "KRW"
+                      },
+                      {
+                        "@type": "UnitPriceSpecification",
+                        "priceType": "https://schema.org/StrikethroughPrice",
+                        "price": 69800,
+                        "priceCurrency": "KRW"
+                      }
+                    ]
+                  }
+                }
+                </script>
+              </head>
+            </html>
+        """.trimIndent()
+
+        val metadata = extractor.extract(html, "https://www.xbox.com/ko-KR/games/store/example")
+
+        assertEquals("디지몬 스토리 타임 스트레인저", metadata.title)
+        assertEquals(41_880L, metadata.price)
+        assertEquals("structured JSON-LD product data", metadata.confidenceNote)
+    }
+
+    @Test
+    fun prefersCurrentSalePriceOverPreviousPriceInVisibleText() {
+        val html = """
+            <html>
+              <head>
+                <meta property="og:title" content="Xbox 세일 게임" />
+              </head>
+              <body>
+                <div>
+                  <span>이전 가격 ₩59,900</span>
+                  <span>현재 가격 ₩17,970</span>
+                  <span>70% 할인</span>
+                </div>
+              </body>
+            </html>
+        """.trimIndent()
+
+        val metadata = extractor.extract(html, "https://www.xbox.com/ko-KR/games/store/example")
+
+        assertEquals("Xbox 세일 게임", metadata.title)
+        assertEquals(17_970L, metadata.price)
+        assertEquals("visible page text", metadata.confidenceNote)
+    }
 }

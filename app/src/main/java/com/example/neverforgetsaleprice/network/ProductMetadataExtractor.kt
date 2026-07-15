@@ -5,7 +5,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 
 class ProductMetadataExtractor {
     fun extract(html: String, baseUrl: String): ProductMetadata {
@@ -122,7 +121,31 @@ class ProductMetadataExtractor {
         val price = json.optString("price")
             .ifBlank { json.optString("lowPrice") }
             .ifBlank { json.optString("highPrice") }
-        return PriceNormalizer.parsePrice(price)
+        return PriceNormalizer.parsePrice(price) ?: readPriceSpecification(json.opt("priceSpecification"))
+    }
+
+    private fun readPriceSpecification(value: Any?): Long? {
+        return when (value) {
+            is JSONObject -> readPriceSpecificationObject(value)
+            is JSONArray -> {
+                val specifications = (0 until value.length())
+                    .mapNotNull { value.opt(it) as? JSONObject }
+                val salePrice = specifications.firstNotNullOfOrNull { specification ->
+                    val priceType = specification.optString("priceType")
+                    if (priceType.contains("StrikethroughPrice", ignoreCase = true)) {
+                        null
+                    } else {
+                        readPriceSpecificationObject(specification)
+                    }
+                }
+                salePrice ?: specifications.firstNotNullOfOrNull(::readPriceSpecificationObject)
+            }
+            else -> null
+        }
+    }
+
+    private fun readPriceSpecificationObject(json: JSONObject): Long? {
+        return PriceNormalizer.parsePrice(json.optString("price"))
     }
 
     private fun readImage(json: JSONObject): String? {
@@ -156,15 +179,66 @@ class ProductMetadataExtractor {
         document.select("script, style, noscript").remove()
         val text = document.body()?.text().orEmpty()
         val candidates = PRICE_REGEX.findAll(text)
-            .mapNotNull { PriceNormalizer.parsePrice(it.value) }
-            .filter { it in MIN_REASONABLE_PRICE..MAX_REASONABLE_PRICE }
+            .mapNotNull { match ->
+                PriceNormalizer.parsePrice(match.value)
+                    ?.takeIf { it in MIN_REASONABLE_PRICE..MAX_REASONABLE_PRICE }
+                    ?.let {
+                        VisiblePriceCandidate(
+                            price = it,
+                            score = scorePriceContext(text, match.range.first, match.range.last)
+                        )
+                    }
+            }
             .toList()
 
-        return candidates
-            .groupingBy { it }
-            .eachCount()
-            .maxWithOrNull(compareBy<Map.Entry<Long, Int>> { it.value }.thenByDescending { it.key })
-            ?.key
+        if (candidates.isEmpty()) return null
+
+        val groupedCandidates = candidates
+            .groupBy { it.price }
+            .map { (price, matches) ->
+                VisiblePriceSummary(
+                    price = price,
+                    count = matches.size,
+                    bestScore = matches.maxOf { it.score }
+                )
+            }
+
+        val hasSaleContext = groupedCandidates.any { it.bestScore > 0 }
+        val hasGlobalSaleContext = hasGlobalSaleContext(text)
+        return if (hasSaleContext) {
+            groupedCandidates.maxWithOrNull(
+                compareBy<VisiblePriceSummary> { it.bestScore }
+                    .thenBy { it.count }
+                    .thenByDescending { -it.price }
+            )?.price
+        } else if (hasGlobalSaleContext && groupedCandidates.size > 1) {
+            groupedCandidates.minOf { it.price }
+        } else {
+            groupedCandidates.maxWithOrNull(
+                compareBy<VisiblePriceSummary> { it.count }
+                    .thenBy { it.price }
+            )?.price
+        }
+    }
+
+    private fun scorePriceContext(text: String, start: Int, end: Int): Int {
+        val nearBefore = text.substring((start - NEAR_CONTEXT_WINDOW).coerceAtLeast(0), start).lowercase()
+        val before = text.substring((start - CONTEXT_WINDOW).coerceAtLeast(0), start).lowercase()
+        val after = text.substring((end + 1).coerceAtMost(text.length), (end + 1 + CONTEXT_WINDOW).coerceAtMost(text.length)).lowercase()
+        val context = "$before $after"
+
+        var score = 0
+        if (CURRENT_PRICE_KEYWORDS.any { nearBefore.contains(it) }) score += 80
+        if (SALE_PRICE_KEYWORDS.any { context.contains(it) }) score += 30
+        if (ORIGINAL_PRICE_KEYWORDS.any { nearBefore.contains(it) }) score -= 80
+        return score
+    }
+
+    private fun hasGlobalSaleContext(text: String): Boolean {
+        val normalized = text.lowercase()
+        return CURRENT_PRICE_KEYWORDS.any { normalized.contains(it) } ||
+            SALE_PRICE_KEYWORDS.any { normalized.contains(it) } ||
+            ORIGINAL_PRICE_KEYWORDS.any { normalized.contains(it) }
     }
 
     private fun metaContent(document: Document, selector: String): String? {
@@ -185,8 +259,51 @@ class ProductMetadataExtractor {
         fun hasAnyValue(): Boolean = title != null || price != null || imageUrl != null
     }
 
+    private data class VisiblePriceCandidate(
+        val price: Long,
+        val score: Int
+    )
+
+    private data class VisiblePriceSummary(
+        val price: Long,
+        val count: Int,
+        val bestScore: Int
+    )
+
     companion object {
         private val PRICE_REGEX = Regex("""(?:₩|KRW\s*)?\d{1,3}(?:,\d{3})+(?:원)?|\d{4,9}\s*원""")
+        private val CURRENT_PRICE_KEYWORDS = listOf(
+            "현재 가격",
+            "현재가",
+            "할인가",
+            "판매가",
+            "new price",
+            "current price",
+            "sale price",
+            "now"
+        )
+        private val SALE_PRICE_KEYWORDS = listOf(
+            "할인",
+            "세일",
+            "특가",
+            "discount",
+            "sale",
+            "deal"
+        )
+        private val ORIGINAL_PRICE_KEYWORDS = listOf(
+            "이전 가격",
+            "원래 가격",
+            "정가",
+            "기존가",
+            "full price",
+            "previous price",
+            "old price",
+            "regular price",
+            "list price",
+            "msrp"
+        )
+        private const val NEAR_CONTEXT_WINDOW = 24
+        private const val CONTEXT_WINDOW = 48
         private const val MIN_REASONABLE_PRICE = 100L
         private const val MAX_REASONABLE_PRICE = 100_000_000L
     }

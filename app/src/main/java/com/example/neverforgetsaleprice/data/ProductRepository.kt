@@ -34,7 +34,12 @@ class ProductRepository(
 
         runCatching {
             val html = pageFetcher.fetch(url)
-            ProductFetchResult.Success(metadataExtractor.extract(html, url))
+            val metadata = metadataExtractor.extract(html, url)
+            if (metadata.price == null && isXboxAuthUrl(url)) {
+                ProductFetchResult.Failure("Xbox 로그인 완료 URL에는 상품 가격 정보가 없습니다. Xbox 또는 Microsoft Store의 상품 상세 URL을 등록해 주세요.")
+            } else {
+                ProductFetchResult.Success(metadata)
+            }
         }.getOrElse { error ->
             ProductFetchResult.Failure(error.toUserMessage())
         }
@@ -284,6 +289,11 @@ class ProductRepository(
     private fun isValidHttpUrl(url: String): Boolean {
         val trimmed = url.trim()
         return URLUtil.isHttpUrl(trimmed) || URLUtil.isHttpsUrl(trimmed)
+    }
+
+    private fun isXboxAuthUrl(url: String): Boolean {
+        val trimmed = url.trim().lowercase()
+        return trimmed.contains("xbox.com/") && trimmed.contains("/auth/msa")
     }
 
     private fun Throwable.toCheckStatus(): CheckStatus {
